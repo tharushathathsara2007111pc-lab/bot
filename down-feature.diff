@@ -1,0 +1,131 @@
+--- downloader.cjs.orig	2026-11-23 06:45:36.058256489 +0000
++++ downloader.cjs	2026-11-23 06:45:49.741200564 +0000
+@@ -25,7 +25,9 @@
+ const DATA_DIR = path.join(ROOT, 'data');
+ const DL_DIR = path.join(ROOT, 'downloads');
+ const TEMP_DIR = path.join(DL_DIR, 'temp');
+-for (const d of [DATA_DIR, DL_DIR, TEMP_DIR, path.join(ROOT, 'auth_info')]) fs.mkdirSync(d, { recursive: true });
++// `down` = local drop folder: files placed here are uploaded to the selected target group by the ,down command.
++const DOWN_DIR = path.join(ROOT, 'down');
++for (const d of [DATA_DIR, DL_DIR, TEMP_DIR, DOWN_DIR, path.join(ROOT, 'auth_info')]) fs.mkdirSync(d, { recursive: true });
+ const DB_FILE = path.join(DATA_DIR, 'state.json');
+ 
+ // ---- Upload rules -----------------------------------------------------------------------------------
+@@ -856,6 +858,63 @@
+     return fn();
+   });
+ }
++// ---- ,down implementation ------------------------------------------------------------------------------
++let downRunning = false;
++function scanDownFolder() {
++  fs.mkdirSync(DOWN_DIR, { recursive: true });
++  const now = Date.now();
++  return fs.readdirSync(DOWN_DIR, { withFileTypes: true })
++    .filter(d => d.isFile() && !d.name.startsWith('.'))
++    .map(d => {
++      const full = path.join(DOWN_DIR, d.name);
++      const st = fs.statSync(full);
++      return { name: d.name, full, size: st.size, settled: now - st.mtimeMs >= 3000 };
++    })
++    .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
++}
++async function runDownFolderUpload(sock, jid) {
++  const target = db.targetGroups.find(g => g.jid === db.selectedGroupJid);
++  if (!target) {
++    await sock.sendMessage(jid, { text: '⚠️ No target group selected. Send ,setgroup in a group, then use ,selectgroup 1. Use ,groups to view saved groups.' });
++    return;
++  }
++  if (downRunning) { await sock.sendMessage(jid, { text: '⏳ A ,down upload is already running. Please wait for it to finish.' }); return; }
++  const files = scanDownFolder();
++  if (!files.length) { await sock.sendMessage(jid, { text: '📂 [MPM] The `down` folder is empty. Put files in it, then send ,down again.' }); return; }
++
++  downRunning = true;
++  const ok = [], failed = [];
++  try {
++    const head = await sock.sendMessage(jid, { text: `📦 [MPM] ${files.length} file(s) found in \`down\`.\n📤 Destination: ${target.name}\n⏳ Starting…` });
++    const say = async (text) => {
++      try { await sock.sendMessage(jid, { text, edit: head.key }); }
++      catch { try { await sock.sendMessage(jid, { text }); } catch {} }
++    };
++    for (let i = 0; i < files.length; i++) {
++      const f = files[i];
++      await say(`⬆️ [MPM] Uploading ${i + 1}/${files.length}\n📄 ${f.name}\n📏 ${bytes(f.size)}\n📤 ${target.name}\n\n✅ ${ok.length}   ❌ ${failed.length}`);
++      try {
++        if (!f.settled) throw new Error('file is still being copied (modified <3s ago)');
++        if (f.size === 0) throw new Error('empty file');
++        if (f.size > UPLOAD_MAX_BYTES) throw new Error('larger than ' + UPLOAD_MAX_TEXT);
++        await waitUploadGap(null);
++        try {
++          await sock.sendMessage(target.jid, { document: { url: f.full }, fileName: f.name, mimetype: mimeTypeFor(f.full) });
++        } finally { markUploadDone(); }
++        // Delete ONLY after WhatsApp accepted the upload.
++        try { await fs.promises.unlink(f.full); } catch (e) { console.error('[down] could not delete', f.name, e.message); }
++        ok.push(f);
++      } catch (e) {
++        console.error('[down] upload failed:', f.name, e.message);
++        failed.push({ name: f.name, reason: String(e.message || e).slice(0, 120) });
++      }
++    }
++    let report = `📊 [MPM] *down* finished\n📤 Destination: ${target.name}\n✅ Uploaded & deleted: ${ok.length}\n❌ Failed (kept in folder): ${failed.length}`;
++    if (failed.length) report += '\n\n' + failed.map(f => `• ${f.name} — ${f.reason}`).join('\n');
++    await say(report);
++  } finally { downRunning = false; }
++}
++
+ async function handleMessage(sock, msg) {
+   if (!msg.message) return;
+   const jid = msg.key.remoteJid;
+@@ -875,7 +934,7 @@
+   const text = msg.message.conversation || msg.message.extendedTextMessage?.text ||
+     msg.message.documentMessage?.caption || msg.message.imageMessage?.caption || '';
+   const trimmed = text.trim();
+-  if (fromMe && (!isOwner(sender) || !/^[,.][a-z0-9]+(?:\s|$)/i.test(trimmed))) return;
++  if (fromMe && (!isOwner(sender) || !/^(?:[,.][a-z0-9]+(?:\s|$)|down$)/i.test(trimmed))) return;
+   const admin = isAdmin(sender);
+   const contextInfo = msg.message.extendedTextMessage?.contextInfo || msg.message.imageMessage?.contextInfo || msg.message.videoMessage?.contextInfo || msg.message.documentMessage?.contextInfo;
+   const quotedParticipant = contextInfo?.participant ? jidNumber(contextInfo.participant) : '';
+@@ -922,6 +981,16 @@
+     if (db.selectedGroupJid === removed.jid) db.selectedGroupJid = db.targetGroups[0]?.jid || '';
+     saveDB(); await sock.sendMessage(jid, { text: `🗑️ Removed saved group: ${removed.name}` }); return;
+   }
++  // ---- ,down : upload everything in the local `down` folder to the selected target group (Admin/Owner only) ----
++  if (command === ',down' || (command === 'down' && args.length === 0)) {
++    if (!isAdmin(sender)) {
++      // The plain word "down" may be normal chat, so stay silent for non-admins; ,down gets a notice.
++      if (command === ',down') await sock.sendMessage(jid, { text: '⛔ Admin/Owner only command.' });
++      return;
++    }
++    await runDownFolderUpload(sock, jid);
++    return;
++  }
+   // All public commands use comma-prefix; legacy dot commands are intentionally ignored.
+   if (command === ',limit' || command === ',setlimit') {
+     if (!admin) { await sock.sendMessage(jid, { text: '⛔ Admin only command.' }); return; }
+--- index.js.orig	2026-11-23 06:45:36.059234906 +0000
++++ index.js	2026-11-23 06:45:49.739728305 +0000
+@@ -2623,7 +2623,7 @@
+     const msg = messages[0];
+     if (!msg?.message) return;
+     const isFromMe = Boolean(msg.key.fromMe);
+-    if (isFromMe && !/^[,.][a-z0-9]+(?:\s|$)/i.test((msg.message.conversation || msg.message.extendedTextMessage?.text || "").trim())) {
++    if (isFromMe && !/^(?:[,.][a-z0-9]+(?:\s|$)|down$)/i.test((msg.message.conversation || msg.message.extendedTextMessage?.text || "").trim())) {
+       return;
+     }
+ 
+@@ -2636,7 +2636,7 @@
+ 
+     if (!body) return;
+     // Route comma-prefixed downloader commands to the downloader module.
+-    const downloaderCommand = /^,(dl|dl1|dlr|rename|zip|unzip|gofile|buzz|torrent|magnet|limit|setlimit|addlimit|removelimit|resetlimit|limitcheck|mylimit|checklimit|status|admin|addadmin|removeadmin|admins|block|unblock|cancelall|setgroup|groups|selectgroup|removegroup|task|cancel)\b/i.test(body) || /^\.buzz\b/i.test(body);
++    const downloaderCommand = /^,(dl|dl1|dlr|rename|zip|unzip|gofile|buzz|torrent|magnet|limit|setlimit|addlimit|removelimit|resetlimit|limitcheck|mylimit|checklimit|status|admin|addadmin|removeadmin|admins|block|unblock|cancelall|setgroup|groups|selectgroup|removegroup|task|cancel|down)\b/i.test(body) || /^\.buzz\b/i.test(body) || /^down$/i.test(body);
+     if (downloaderCommand) {
+       await handleDownloaderMessage(stableSock, msg);
+       return;
+@@ -2763,6 +2763,7 @@
+           "│ 📂 ,unzip [PREFIX] <link>\n" +
+           "│    ↳ Extract ZIP and upload inner contents.\n│\n" +
+           "│ 🎯 ,setgroup  |  ,groups\n" +
++          "│ 📂 ,down  (upload `down` folder → target group)\n" +
+           "│    ↳ Save up to 5 target groups and view them.\n│\n" +
+           "│ 🔀 ,selectgroup <1-5>\n" +
+           "│    ↳ Choose where private Gofile downloads go.\n│\n" +

@@ -1,0 +1,15 @@
+{
+  "owner": "",
+  "prefix": "[MPM]",
+  "dailyLimitBytes": 0,
+  "userMaxFileBytes": 10737418240,
+  "adminMaxFileBytes": 10737418240,
+  "cooldownSeconds": 3,
+  "maxLinksPerMessage": 20,
+  "reserveDiskBytes": 1073741824,
+  "progressIntervalSeconds": 5,
+  "connections": 4,
+  "multipartMinBytes": 8388608,
+  "splitLarge": true,
+  "maxSplitBytes": 10737418240
+}
